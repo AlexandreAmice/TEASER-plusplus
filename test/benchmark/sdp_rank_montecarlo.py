@@ -28,12 +28,18 @@ P = np.array(
 )
 
 VALID_STATUSES = {"optimal", "optimal_inaccurate"}
+SCRIPT_PATH = Path(__file__).resolve()
+TEASER_ROOT = SCRIPT_PATH.parents[2]
+DEFAULT_BUILD_DIR = TEASER_ROOT / "build" / "test" / "benchmark"
+DEFAULT_ANALYSIS_DIR = TEASER_ROOT.parents[1] / "assets" / "teaser_analysis"
 
 
-def get_q_cost(v1: np.ndarray, v2: np.ndarray, noise_bound: float, cbar2: float = 1.0) -> np.ndarray:
+def get_q_cost(
+    v1: np.ndarray, v2: np.ndarray, noise_bound: float, cbar2: float = 1.0
+) -> np.ndarray:
     n = v1.shape[1]
     npm = 4 + 4 * n
-    noise_bound_scaled = cbar2 * (noise_bound ** 2)
+    noise_bound_scaled = cbar2 * (noise_bound**2)
 
     q1 = np.zeros((npm, npm))
     q2 = np.zeros((npm, npm))
@@ -45,11 +51,15 @@ def get_q_cost(v1: np.ndarray, v2: np.ndarray, noise_bound: float, cbar2: float 
         temp_b = P.T @ temp_map
         p_k = temp_b.reshape((4, 4), order="F")
 
-        ck1 = 0.5 * (np.dot(v1[:, k], v1[:, k]) + np.dot(v2[:, k], v2[:, k]) - noise_bound_scaled)
+        ck1 = 0.5 * (
+            np.dot(v1[:, k], v1[:, k]) + np.dot(v2[:, k], v2[:, k]) - noise_bound_scaled
+        )
         q1[0:4, start : start + 4] += -0.5 * p_k + 0.5 * ck1 * np.eye(4)
         q1[start : start + 4, 0:4] += -0.5 * p_k + 0.5 * ck1 * np.eye(4)
 
-        ck2 = 0.5 * (np.dot(v1[:, k], v1[:, k]) + np.dot(v2[:, k], v2[:, k]) + noise_bound_scaled)
+        ck2 = 0.5 * (
+            np.dot(v1[:, k], v1[:, k]) + np.dot(v2[:, k], v2[:, k]) + noise_bound_scaled
+        )
         q2[start : start + 4, start : start + 4] += -p_k + ck2 * np.eye(4)
 
     return q1 + q2
@@ -85,7 +95,7 @@ def solve_sdp(
     return z.value, value, str(problem.status), runtime_ms
 
 
-def numerical_rank(z: np.ndarray | None, tol: float = 1e-6) -> float:
+def numerical_rank(z: np.ndarray | None, tol: float = 1e-3) -> float:
     if z is None or not np.all(np.isfinite(z)):
         return float("nan")
     eigvals = np.linalg.eigvalsh(0.5 * (z + z.T))
@@ -154,19 +164,39 @@ def summarize_condition(df: pd.DataFrame, prefix: str) -> dict[str, object]:
     return summary
 
 
+def discover_input_csv(arg_index: int, filename: str) -> Path:
+    if len(sys.argv) > arg_index:
+        return Path(sys.argv[arg_index]).expanduser().resolve()
+
+    candidates = [
+        DEFAULT_BUILD_DIR / filename,
+        DEFAULT_ANALYSIS_DIR / filename,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    checked_paths = "\n".join(f"  - {path}" for path in candidates)
+    raise FileNotFoundError(
+        f"Unable to find '{filename}'. Checked:\n{checked_paths}\n"
+        "Pass the CSV paths explicitly or generate the bunny candidate CSVs first."
+    )
+
+
+def output_csv_path(arg_index: int, filename: str, default_dir: Path) -> Path:
+    if len(sys.argv) > arg_index:
+        return Path(sys.argv[arg_index]).expanduser().resolve()
+    return default_dir / filename
+
+
 def main() -> int:
-    out_results_csv = (
-        Path(sys.argv[1]) if len(sys.argv) > 1 else Path("build/test/benchmark/bunny_sdp_primal_results.csv")
+    trial_summary_csv = discover_input_csv(3, "bunny_teaser_candidate_trials.csv")
+    tims_csv = discover_input_csv(4, "bunny_teaser_candidate_tims.csv")
+    default_output_dir = trial_summary_csv.parent
+    out_results_csv = output_csv_path(
+        1, "bunny_sdp_primal_results.csv", default_output_dir
     )
-    out_summary_csv = (
-        Path(sys.argv[2]) if len(sys.argv) > 2 else Path("build/test/benchmark/bunny_sdp_summary.csv")
-    )
-    trial_summary_csv = (
-        Path(sys.argv[3]) if len(sys.argv) > 3 else Path("build/test/benchmark/bunny_teaser_candidate_trials.csv")
-    )
-    tims_csv = (
-        Path(sys.argv[4]) if len(sys.argv) > 4 else Path("build/test/benchmark/bunny_teaser_candidate_tims.csv")
-    )
+    out_summary_csv = output_csv_path(2, "bunny_sdp_summary.csv", default_output_dir)
     solver = sys.argv[5] if len(sys.argv) > 5 else "CLARABEL"
 
     trials_df = pd.read_csv(trial_summary_csv)
@@ -204,7 +234,9 @@ def main() -> int:
             rows.append(row)
             continue
 
-        trial_tims = tims_df[tims_df["trial"] == int(trial.trial)].sort_values("tim_index")
+        trial_tims = tims_df[tims_df["trial"] == int(trial.trial)].sort_values(
+            "tim_index"
+        )
         v1 = trial_tims[["v1x", "v1y", "v1z"]].to_numpy(dtype=float).T
         v2 = trial_tims[["v2x", "v2y", "v2z"]].to_numpy(dtype=float).T
         theta = trial_tims["theta"].to_numpy(dtype=float)
@@ -226,16 +258,26 @@ def main() -> int:
                 "candidate_cost": candidate_cost,
                 "with_objective": obj_with,
                 "without_objective": obj_without,
-                "with_relative_gap": relative_gap(candidate_cost, obj_with)
-                if status_with in VALID_STATUSES
-                else float("nan"),
-                "without_relative_gap": relative_gap(candidate_cost, obj_without)
-                if status_without in VALID_STATUSES
-                else float("nan"),
-                "with_rank": numerical_rank(z_with) if status_with in VALID_STATUSES else float("nan"),
-                "without_rank": numerical_rank(z_without)
-                if status_without in VALID_STATUSES
-                else float("nan"),
+                "with_relative_gap": (
+                    relative_gap(candidate_cost, obj_with)
+                    if status_with in VALID_STATUSES
+                    else float("nan")
+                ),
+                "without_relative_gap": (
+                    relative_gap(candidate_cost, obj_without)
+                    if status_without in VALID_STATUSES
+                    else float("nan")
+                ),
+                "with_rank": (
+                    numerical_rank(z_with)
+                    if status_with in VALID_STATUSES
+                    else float("nan")
+                ),
+                "without_rank": (
+                    numerical_rank(z_without)
+                    if status_without in VALID_STATUSES
+                    else float("nan")
+                ),
                 "with_status": status_with,
                 "without_status": status_without,
                 "with_runtime_ms": runtime_with,
@@ -246,7 +288,10 @@ def main() -> int:
 
     results_df = pd.DataFrame(rows)
     summary_df = pd.DataFrame(
-        [summarize_condition(results_df, "with"), summarize_condition(results_df, "without")]
+        [
+            summarize_condition(results_df, "with"),
+            summarize_condition(results_df, "without"),
+        ]
     )
 
     out_results_csv.parent.mkdir(parents=True, exist_ok=True)

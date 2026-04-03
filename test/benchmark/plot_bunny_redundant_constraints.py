@@ -13,6 +13,10 @@ import pandas as pd
 VALID_STATUSES = {"optimal", "optimal_inaccurate"}
 COLORS = {"with": "#1f77b4", "without": "#d62728"}
 LABELS = {"with": "With redundant constraints", "without": "Without redundant constraints"}
+SCRIPT_PATH = Path(__file__).resolve()
+TEASER_ROOT = SCRIPT_PATH.parents[2]
+DEFAULT_BUILD_DIR = TEASER_ROOT / "build" / "test" / "benchmark"
+DEFAULT_ANALYSIS_DIR = TEASER_ROOT.parents[1] / "assets" / "teaser_analysis"
 
 
 def configure_style() -> None:
@@ -183,11 +187,33 @@ def save_rank_overlay_hist(df: pd.DataFrame, out_path: Path) -> None:
     plt.close(fig)
 
 
-def main() -> int:
-    results_csv = (
-        Path(sys.argv[1]) if len(sys.argv) > 1 else Path("build/test/benchmark/bunny_sdp_primal_results.csv")
+def discover_results_csv() -> Path:
+    if len(sys.argv) > 1:
+        return Path(sys.argv[1]).expanduser().resolve()
+
+    candidates = [
+        DEFAULT_BUILD_DIR / "bunny_sdp_primal_results.csv",
+        DEFAULT_ANALYSIS_DIR / "bunny_sdp_primal_results.csv",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    checked_paths = "\n".join(f"  - {path}" for path in candidates)
+    raise FileNotFoundError(
+        "Unable to find 'bunny_sdp_primal_results.csv'. Checked:\n"
+        f"{checked_paths}\n"
+        "Pass the results CSV explicitly or run sdp_rank_montecarlo.py first."
     )
-    output_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else results_csv.parent
+
+
+def main() -> int:
+    results_csv = discover_results_csv()
+    output_dir = (
+        Path(sys.argv[2]).expanduser().resolve()
+        if len(sys.argv) > 2
+        else results_csv.parent
+    )
 
     configure_style()
     df = pd.read_csv(results_csv)
