@@ -98,6 +98,14 @@ public:
      * Solver for eigendecomposition / spectral decomposition
      */
     EIG_SOLVER_TYPE eig_decomposition_solver = EIG_SOLVER_TYPE::EIGEN;
+
+    /**
+     * Enforce the redundant off-diagonal symmetry constraints from the SDP relaxation.
+     *
+     * When false, the certifier skips the dual contribution induced by the redundant constraints.
+     * This is useful for ablation of the tightened relaxation against the naive one.
+     */
+    bool use_redundant_constraints = true;
   };
 
   DRSCertifier() = delete;

@@ -177,6 +177,13 @@ teaser::DRSCertifier::certify(const Eigen::Matrix3d& R_solution,
       break;
     }
 
+    if (!params_.use_redundant_constraints) {
+      // Without the redundant constraints there is no off-diagonal dual projection to update, so
+      // M_affine remains fixed and extra DRS iterations are uninformative.
+      exceeded_maxiters = false;
+      break;
+    }
+
     // update M
     M += params_.gamma_tau * (M_affine - M_PSD);
   }
@@ -328,6 +335,14 @@ void teaser::DRSCertifier::getOptimalDualProjection(
   int Npm = W.rows();
   int N = Npm / 4 - 1;
   assert(theta_prepended.cols() == N + 1);
+
+  // The skew-symmetric off-diagonal dual blocks are the certifier-side manifestation of the
+  // redundant/implied primal symmetry constraints [Z]_{ij} = [Z]_{ij}^T from the paper.
+  if (!params_.use_redundant_constraints) {
+    W_dual->resize(Npm, Npm);
+    W_dual->setZero();
+    return;
+  }
 
   // first project the off-diagonal blocks
   int nr_off_diag_blks = A_inv.rows();
