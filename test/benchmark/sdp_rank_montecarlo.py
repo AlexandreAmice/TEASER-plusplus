@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -25,6 +26,8 @@ P = np.array(
     ],
     dtype=float,
 )
+
+VALID_STATUSES = {"optimal", "optimal_inaccurate"}
 
 
 def get_q_cost(v1: np.ndarray, v2: np.ndarray, noise_bound: float, cbar2: float = 1.0) -> np.ndarray:
@@ -52,29 +55,12 @@ def get_q_cost(v1: np.ndarray, v2: np.ndarray, noise_bound: float, cbar2: float 
     return q1 + q2
 
 
-def load_bunny_points(path: Path) -> np.ndarray:
-    points = []
-    in_data = False
-    with path.open() as f:
-        for line in f:
-            line = line.strip()
-            if not in_data:
-                if line == "DATA ascii":
-                    in_data = True
-                continue
-            if not line:
-                continue
-            x, y, z = map(float, line.split())
-            points.append([x, y, z])
-    return np.asarray(points, dtype=float).T
-
-
-def sample_columns(points: np.ndarray, num_vectors: int, rng: np.random.Generator) -> np.ndarray:
-    idx = rng.permutation(points.shape[1])[:num_vectors]
-    return points[:, idx]
-
-
-def solve_sdp(q_cost: np.ndarray, num_vectors: int, use_redundant: bool, solver: str) -> tuple[np.ndarray, float, str, float]:
+def solve_sdp(
+    q_cost: np.ndarray,
+    num_vectors: int,
+    use_redundant: bool,
+    solver: str,
+) -> tuple[np.ndarray | None, float, str, float]:
     npm = 4 + 4 * num_vectors
     z = cp.Variable((npm, npm), symmetric=True)
     constraints = [z >> 0, cp.trace(z[0:4, 0:4]) == 1]
@@ -95,79 +81,179 @@ def solve_sdp(q_cost: np.ndarray, num_vectors: int, use_redundant: bool, solver:
     start = time.perf_counter()
     problem.solve(solver=solver, verbose=False)
     runtime_ms = 1000.0 * (time.perf_counter() - start)
-    return z.value, float(problem.value), problem.status, runtime_ms
+    value = float(problem.value) if problem.value is not None else float("nan")
+    return z.value, value, str(problem.status), runtime_ms
 
 
-def numerical_rank(z: np.ndarray, tol: float = 1e-6) -> int:
+def numerical_rank(z: np.ndarray | None, tol: float = 1e-6) -> float:
+    if z is None or not np.all(np.isfinite(z)):
+        return float("nan")
     eigvals = np.linalg.eigvalsh(0.5 * (z + z.T))
     eigvals = np.maximum(eigvals, 0.0)
     if eigvals[-1] <= 0:
-      return 0
-    return int(np.sum(eigvals > tol * eigvals[-1]))
+        return 0.0
+    return float(np.sum(eigvals > tol * eigvals[-1]))
 
 
-def run_trial(points: np.ndarray, rng: np.random.Generator, num_vectors: int, outlier_ratio: float, noise_bound: float, solver: str) -> dict:
-    q = rng.normal(size=4)
-    q = q / np.linalg.norm(q)
-    w, x, y, z = q
-    r = np.array(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ]
-    )
+def build_candidate_cost(q_cost: np.ndarray, q: np.ndarray, theta: np.ndarray) -> float:
+    theta_prepended = np.concatenate(([1.0], theta))
+    x_hat = np.kron(theta_prepended, q)
+    return float(x_hat @ q_cost @ x_hat)
 
-    v1 = sample_columns(points, num_vectors, rng)
-    v2 = r @ v1 + rng.uniform(-noise_bound, noise_bound, size=(3, num_vectors))
 
-    num_outliers = int(round(num_vectors * outlier_ratio))
-    if num_outliers > 0:
-        idxs = np.arange(num_vectors - num_outliers, num_vectors)
-        v2[:, idxs] = rng.uniform(3.0, 8.0, size=(3, num_outliers))
+def relative_gap(candidate_cost: float, optimum_cost: float) -> float:
+    eps = 1e-12
+    denom = max(abs(optimum_cost), eps)
+    return float((candidate_cost - optimum_cost) / denom)
 
-    q_cost = get_q_cost(v1, v2, noise_bound)
-    z_with, obj_with, status_with, runtime_with = solve_sdp(q_cost, num_vectors, True, solver)
-    z_without, obj_without, status_without, runtime_without = solve_sdp(q_cost, num_vectors, False, solver)
 
-    return {
-        "with_rank": numerical_rank(z_with),
-        "without_rank": numerical_rank(z_without),
-        "with_objective": obj_with,
-        "without_objective": obj_without,
-        "with_status": status_with,
-        "without_status": status_without,
-        "with_runtime_ms": runtime_with,
-        "without_runtime_ms": runtime_without,
+def summarize_condition(df: pd.DataFrame, prefix: str) -> dict[str, object]:
+    valid = df[df[f"{prefix}_status"].isin(VALID_STATUSES)].copy()
+    summary: dict[str, object] = {
+        "condition": prefix,
+        "num_total_trials": int(len(df)),
+        "num_successful_solves": int(len(valid)),
     }
+    if valid.empty:
+        summary.update(
+            {
+                "median_relative_gap": float("nan"),
+                "q25_relative_gap": float("nan"),
+                "q75_relative_gap": float("nan"),
+                "median_rank": float("nan"),
+                "q25_rank": float("nan"),
+                "q75_rank": float("nan"),
+                "median_runtime_ms": float("nan"),
+                "q25_runtime_ms": float("nan"),
+                "q75_runtime_ms": float("nan"),
+                "rank_counts": json.dumps({}),
+            }
+        )
+        return summary
+
+    gap = valid[f"{prefix}_relative_gap"].to_numpy()
+    rank = valid[f"{prefix}_rank"].to_numpy()
+    runtime = valid[f"{prefix}_runtime_ms"].to_numpy()
+    unique_rank, counts = np.unique(rank.astype(int), return_counts=True)
+    rank_counts = {int(r): int(c) for r, c in zip(unique_rank, counts)}
+
+    summary.update(
+        {
+            "median_relative_gap": float(np.median(gap)),
+            "q25_relative_gap": float(np.quantile(gap, 0.25)),
+            "q75_relative_gap": float(np.quantile(gap, 0.75)),
+            "median_rank": float(np.median(rank)),
+            "q25_rank": float(np.quantile(rank, 0.25)),
+            "q75_rank": float(np.quantile(rank, 0.75)),
+            "median_runtime_ms": float(np.median(runtime)),
+            "q25_runtime_ms": float(np.quantile(runtime, 0.25)),
+            "q75_runtime_ms": float(np.quantile(runtime, 0.75)),
+            "rank_counts": json.dumps(rank_counts, sort_keys=True),
+        }
+    )
+    return summary
 
 
 def main() -> int:
-    out_csv = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("build/test/benchmark/sdp_rank_distribution.csv")
-    num_trials = int(sys.argv[2]) if len(sys.argv) > 2 else 8
-    num_vectors = int(sys.argv[3]) if len(sys.argv) > 3 else 8
-    outlier_ratio = float(sys.argv[4]) if len(sys.argv) > 4 else 0.2
-    noise_bound = float(sys.argv[5]) if len(sys.argv) > 5 else 0.01
-    solver = sys.argv[6] if len(sys.argv) > 6 else "SCS"
-    bunny_path = Path(sys.argv[7]) if len(sys.argv) > 7 else Path("test/teaser/data/bunny.pcd")
+    out_results_csv = (
+        Path(sys.argv[1]) if len(sys.argv) > 1 else Path("build/test/benchmark/bunny_sdp_primal_results.csv")
+    )
+    out_summary_csv = (
+        Path(sys.argv[2]) if len(sys.argv) > 2 else Path("build/test/benchmark/bunny_sdp_summary.csv")
+    )
+    trial_summary_csv = (
+        Path(sys.argv[3]) if len(sys.argv) > 3 else Path("build/test/benchmark/bunny_teaser_candidate_trials.csv")
+    )
+    tims_csv = (
+        Path(sys.argv[4]) if len(sys.argv) > 4 else Path("build/test/benchmark/bunny_teaser_candidate_tims.csv")
+    )
+    solver = sys.argv[5] if len(sys.argv) > 5 else "CLARABEL"
 
-    rng = np.random.default_rng(42)
-    points = load_bunny_points(bunny_path)
-    rows = []
-    for trial in range(num_trials):
-        row = {
-            "trial": trial,
-            "num_vectors": num_vectors,
-            "outlier_ratio": outlier_ratio,
-            "noise_bound": noise_bound,
+    trials_df = pd.read_csv(trial_summary_csv)
+    tims_df = pd.read_csv(tims_csv)
+
+    rows: list[dict[str, object]] = []
+    for trial in trials_df.itertuples(index=False):
+        row: dict[str, object] = {
+            "trial": int(trial.trial),
+            "num_points": int(trial.num_points),
+            "outlier_ratio": float(trial.outlier_ratio),
+            "noise_bound": float(trial.noise_bound),
+            "valid": int(trial.valid),
+            "teaser_runtime_ms": float(trial.teaser_runtime_ms),
+            "num_rotation_tims": int(trial.num_rotation_tims),
+            "rotation_inlier_count": int(trial.rotation_inlier_count),
         }
-        row.update(run_trial(points, rng, num_vectors, outlier_ratio, noise_bound, solver))
+
+        if int(trial.valid) != 1:
+            row.update(
+                {
+                    "candidate_cost": float("nan"),
+                    "with_objective": float("nan"),
+                    "without_objective": float("nan"),
+                    "with_relative_gap": float("nan"),
+                    "without_relative_gap": float("nan"),
+                    "with_rank": float("nan"),
+                    "without_rank": float("nan"),
+                    "with_status": "invalid_teaser_solution",
+                    "without_status": "invalid_teaser_solution",
+                    "with_runtime_ms": float("nan"),
+                    "without_runtime_ms": float("nan"),
+                }
+            )
+            rows.append(row)
+            continue
+
+        trial_tims = tims_df[tims_df["trial"] == int(trial.trial)].sort_values("tim_index")
+        v1 = trial_tims[["v1x", "v1y", "v1z"]].to_numpy(dtype=float).T
+        v2 = trial_tims[["v2x", "v2y", "v2z"]].to_numpy(dtype=float).T
+        theta = trial_tims["theta"].to_numpy(dtype=float)
+        q = np.array([trial.qx, trial.qy, trial.qz, trial.qw], dtype=float)
+        q /= np.linalg.norm(q)
+
+        q_cost = get_q_cost(v1, v2, float(trial.noise_bound))
+        candidate_cost = build_candidate_cost(q_cost, q, theta)
+
+        z_with, obj_with, status_with, runtime_with = solve_sdp(
+            q_cost, int(trial.num_rotation_tims), True, solver
+        )
+        z_without, obj_without, status_without, runtime_without = solve_sdp(
+            q_cost, int(trial.num_rotation_tims), False, solver
+        )
+
+        row.update(
+            {
+                "candidate_cost": candidate_cost,
+                "with_objective": obj_with,
+                "without_objective": obj_without,
+                "with_relative_gap": relative_gap(candidate_cost, obj_with)
+                if status_with in VALID_STATUSES
+                else float("nan"),
+                "without_relative_gap": relative_gap(candidate_cost, obj_without)
+                if status_without in VALID_STATUSES
+                else float("nan"),
+                "with_rank": numerical_rank(z_with) if status_with in VALID_STATUSES else float("nan"),
+                "without_rank": numerical_rank(z_without)
+                if status_without in VALID_STATUSES
+                else float("nan"),
+                "with_status": status_with,
+                "without_status": status_without,
+                "with_runtime_ms": runtime_with,
+                "without_runtime_ms": runtime_without,
+            }
+        )
         rows.append(row)
 
-    df = pd.DataFrame(rows)
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_csv, index=False)
-    print(f"Wrote {out_csv}")
+    results_df = pd.DataFrame(rows)
+    summary_df = pd.DataFrame(
+        [summarize_condition(results_df, "with"), summarize_condition(results_df, "without")]
+    )
+
+    out_results_csv.parent.mkdir(parents=True, exist_ok=True)
+    results_df.to_csv(out_results_csv, index=False)
+    summary_df.to_csv(out_summary_csv, index=False)
+    print(f"Wrote {out_results_csv}")
+    print(f"Wrote {out_summary_csv}")
     return 0
 
 
