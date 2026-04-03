@@ -43,6 +43,16 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(certification_redundant_constraints_montecarlo OpenMP::OpenMP_CXX)
 endif()
 
+add_executable(bunny_certifier_suboptimality_benchmark
+        bunny-certifier-suboptimality-benchmark.cc)
+target_link_libraries(bunny_certifier_suboptimality_benchmark
+        Eigen3::Eigen
+        ${TEASERPP_BLAS_LAPACK_LIBS}
+        teaser_registration)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(bunny_certifier_suboptimality_benchmark OpenMP::OpenMP_CXX)
+endif()
+
 # Copy test data files to binary directory
 file(COPY .
     DESTINATION .
